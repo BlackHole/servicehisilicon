@@ -224,11 +224,6 @@ RESULT eStaticServiceHisiliconInfo::getName(const eServiceReference &ref, std::s
 			name = ref.path;
 	}
 
-	std::string res_name = "";
-	std::string res_provider = "";
-	eServiceReference::parseNameAndProviderFromName(name, res_name, res_provider);
-	name = res_name;
-
 	return 0;
 }
 
@@ -243,7 +238,7 @@ int eStaticServiceHisiliconInfo::getInfo(const eServiceReference &ref, int w)
 	{
 	case iServiceInformation::sTimeCreate:
 		{
-			struct stat s;
+			struct stat s = {};
 			if (stat(ref.path.c_str(), &s) == 0)
 			{
 				return s.st_mtime;
@@ -252,7 +247,7 @@ int eStaticServiceHisiliconInfo::getInfo(const eServiceReference &ref, int w)
 		break;
 	case iServiceInformation::sFileSize:
 		{
-			struct stat s;
+			struct stat s = {};
 			if (stat(ref.path.c_str(), &s) == 0)
 			{
 				return s.st_size;
@@ -265,7 +260,7 @@ int eStaticServiceHisiliconInfo::getInfo(const eServiceReference &ref, int w)
 
 long long eStaticServiceHisiliconInfo::getFileSize(const eServiceReference &ref)
 {
-	struct stat s;
+	struct stat s = {};
 	if (stat(ref.path.c_str(), &s) == 0)
 	{
 		return s.st_size;
@@ -1179,7 +1174,6 @@ RESULT eServiceHisilicon::getName(std::string &name)
 	else
 		name = title;
 
-	m_prov = m_ref.prov;
 	return 0;
 }
 
@@ -1441,7 +1435,7 @@ const char *eServiceHisilicon::getAudFormatStr(uint32_t format)
 	switch (format)
 	{
 	case HI_FORMAT_AUDIO_MP2:
-		return "MPEG2";
+		return "MPEG";
 		break;
 	case HI_FORMAT_AUDIO_MP3:
 		return "MPEG3";
@@ -1729,16 +1723,24 @@ std::string eServiceHisilicon::getInfoString(int w)
 	{
 	case sProvider:
 	{
+		std::string prov = m_ref.getProvider();
 		if (pstProgram)
 		{
-			return pstProgram->aszServiceProvider;
+			if (prov.empty()) {
+				if (strlen(pstProgram->aszServiceProvider) == 0)
+					return "IPTV";
+				return pstProgram->aszServiceProvider;
+			} else {
+				return prov;
+			}
+
 		}
 		else
 		{
-			if (m_prov.empty()) {
+			if (prov.empty()) {
 				return "IPTV";
 			} else {
-				return m_prov;
+				return prov;
 			}
 		}
 		break;
@@ -1988,7 +1990,8 @@ eAutoInitPtr<eServiceFactoryHisilicon> init_eServiceFactoryHisilicon(eAutoInitNu
 
 RESULT eServiceHisilicon::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &track)
 {
-	if (m_currentSubtitleStream != track.pid)
+	bool autoturnon = eConfigManager::getConfigBoolValue("config.subtitles.pango_autoturnon", true);
+	if (m_currentSubtitleStream != track.pid || autoturnon)
 	{
 		m_prev_decoder_time = -1;
 		m_decoder_time_valid_state = 0;
@@ -2106,7 +2109,12 @@ RESULT eServiceHisilicon::getSubtitleList(std::vector<struct SubtitleTrack> &sub
 			case HI_FORMAT_SUBTITLE_DVD_SUB:
 				track.page_number = 5; /* VOB */
 				break;
-			case HI_FORMAT_SUBTITLE_DVB_SUB: /* should not happen in ES media */
+			case HI_FORMAT_SUBTITLE_DVB_SUB: /* DVB */
+			{
+				track.type = 0;
+				track.page_number = 7;
+				break;
+			}
 			case HI_FORMAT_SUBTITLE_LRC:
 			case HI_FORMAT_SUBTITLE_SMI:
 			case HI_FORMAT_SUBTITLE_SUB:
