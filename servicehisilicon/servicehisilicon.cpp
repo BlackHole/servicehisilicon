@@ -11,6 +11,7 @@
 #include <lib/components/file_eraser.h>
 #include <lib/gui/esubtitle.h>
 #include <lib/service/service.h>
+#include <lib/service/servicemp3.h>
 #include <lib/gdi/gpixmap.h>
 
 #include <unistd.h>
@@ -23,6 +24,9 @@
 #include <lib/base/estring.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+
+#include <gst/gst.h>
+#include <gst/pbutils/pbutils.h>
 
 #include <linux/dvb/audio.h>
 #include <linux/dvb/video.h>
@@ -37,6 +41,134 @@
 inline void eDebug(const char* fmt, ...) { }
 #endif
 #endif
+
+namespace
+{
+/*
+ * servicehisilicon replaces the normal 0x1001 servicemp3 factory.  The
+ * HiSilicon player is useful for TrueHD because it can pass it through, but
+ * using it for every other media type loses servicemp3's richer codec/channel
+ * reporting and its DTS/TrueHD -> AC3 software transcoding path.
+ *
+ * Probe the source before constructing the service and only select the
+ * proprietary player when a TrueHD stream is actually present.  For all
+ * other sources the original OpenBH eServiceMP3 implementation is used.
+ */
+bool discovererStreamIsTrueHD(GstDiscovererStreamInfo *stream)
+{
+	if (!stream)
+		return false;
+
+	bool truehd = false;
+	GstCaps *caps = gst_discoverer_stream_info_get_caps(stream);
+	if (caps)
+	{
+		for (guint i = 0; i < gst_caps_get_size(caps); ++i)
+		{
+			const GstStructure *st = gst_caps_get_structure(caps, i);
+			const gchar *name = gst_structure_get_name(st);
+			if (name && (!g_ascii_strcasecmp(name, "audio/x-true-hd") ||
+				!g_ascii_strcasecmp(name, "audio/x-truehd") ||
+				!g_ascii_strcasecmp(name, "audio/true-hd")))
+			{
+				truehd = true;
+				break;
+			}
+		}
+		gst_caps_unref(caps);
+	}
+
+	if (!truehd)
+	{
+		const GstTagList *tags = gst_discoverer_stream_info_get_tags(stream);
+		gchar *codec = NULL;
+		if (tags && gst_tag_list_get_string(tags, GST_TAG_AUDIO_CODEC, &codec) && codec)
+		{
+			std::string value(codec);
+			for (std::string::iterator it = value.begin(); it != value.end(); ++it)
+				*it = g_ascii_tolower(*it);
+			truehd = value.find("truehd") != std::string::npos || value.find("true hd") != std::string::npos;
+		}
+		g_free(codec);
+	}
+
+	return truehd;
+}
+
+bool sourceUsesTrueHD(const eServiceReference &ref)
+{
+	std::string path = ref.path;
+
+	/* servicehisilicon uses #... for HTTP headers and &suburi=... for an
+	 * external subtitle. Neither belongs to the URI passed to discoverer. */
+	size_t pos = path.find('#');
+	if (pos != std::string::npos)
+		path.erase(pos);
+	pos = path.find("&suburi=");
+	if (pos != std::string::npos)
+		path.erase(pos);
+
+	if (path.empty())
+		return false;
+
+	/* Raw TrueHD/MLP files do not need a full probe. */
+	size_t end = path.find_first_of("?#");
+	if (end == std::string::npos)
+		end = path.size();
+	size_t dot = path.rfind('.', end);
+	if (dot != std::string::npos)
+	{
+		std::string ext = path.substr(dot, end - dot);
+		for (std::string::iterator it = ext.begin(); it != ext.end(); ++it)
+			*it = g_ascii_tolower(*it);
+		if (ext == ".truehd" || ext == ".thd")
+			return true;
+	}
+
+	GError *error = NULL;
+	GstDiscoverer *discoverer = gst_discoverer_new(3 * GST_SECOND, &error);
+	if (!discoverer)
+	{
+		eDebug("[eServiceHisilicon] TrueHD probe unavailable: %s", error ? error->message : "unknown error");
+		if (error)
+			g_error_free(error);
+		return false;
+	}
+
+	gchar *uri_alloc = NULL;
+	const gchar *uri = path.c_str();
+	if (!gst_uri_is_valid(uri))
+	{
+		uri_alloc = gst_filename_to_uri(path.c_str(), &error);
+		uri = uri_alloc;
+	}
+
+	bool truehd = false;
+	if (uri)
+	{
+		GstDiscovererInfo *info = gst_discoverer_discover_uri(discoverer, uri, &error);
+		if (info)
+		{
+			GList *audio_streams = gst_discoverer_info_get_audio_streams(info);
+			for (GList *it = audio_streams; it && !truehd; it = it->next)
+				truehd = discovererStreamIsTrueHD(GST_DISCOVERER_STREAM_INFO(it->data));
+			gst_discoverer_stream_info_list_free(audio_streams);
+			gst_discoverer_info_unref(info);
+		}
+	}
+
+	if (error)
+	{
+		eDebug("[eServiceHisilicon] TrueHD probe failed for '%s': %s; falling back to eServiceMP3",
+			path.c_str(), error->message);
+		g_error_free(error);
+	}
+	g_free(uri_alloc);
+	g_object_unref(discoverer);
+
+	return truehd;
+}
+}
 
 eServiceFactoryHisilicon::eServiceFactoryHisilicon()
 {
@@ -111,8 +243,16 @@ DEFINE_REF(eServiceFactoryHisilicon)
 	// iServiceHandler
 RESULT eServiceFactoryHisilicon::play(const eServiceReference &ref, ePtr<iPlayableService> &ptr)
 {
-		// check resources...
-	ptr = new eServiceHisilicon(ref);
+	if (sourceUsesTrueHD(ref))
+	{
+		eDebug("[eServiceHisilicon] TrueHD detected - using HiSilicon player");
+		ptr = new eServiceHisilicon(ref);
+	}
+	else
+	{
+		eDebug("[eServiceHisilicon] no TrueHD detected - using OpenBH eServiceMP3");
+		ptr = new eServiceMP3(ref);
+	}
 	return 0;
 }
 
@@ -1562,7 +1702,7 @@ const char *eServiceHisilicon::getAudFormatStr(uint32_t format)
 		return "TWINVQ";
 		break;
 	case HI_FORMAT_AUDIO_TRUEHD:
-		return "TRUEHD";
+		return "Dolby TrueHD";
 		break;
 	case HI_FORMAT_AUDIO_MP4ALS:
 		return "MP4ALS";
@@ -1964,7 +2104,8 @@ RESULT eServiceHisilicon::getTrackInfo(struct iAudioTrackInfo &info, unsigned in
 	}
 
 	info.m_description = getAudFormatStr(pstAudStream->u32Format);
-	
+	info.m_channels = pstAudStream->u16Channels;
+
 	if (info.m_language.empty())
 	{
 		info.m_language = pstAudStream->aszLanguage;

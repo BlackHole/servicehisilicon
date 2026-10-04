@@ -10,6 +10,7 @@ AX_PYTHON_DEVEL
 AC_LANG(C++)
 AX_CXX_COMPILE_STDCXX([20], [ext], [mandatory])
 PKG_CHECK_MODULES(ENIGMA2, enigma2)
+PKG_CHECK_MODULES(GSTREAMER, gstreamer-1.0 gstreamer-pbutils-1.0)
 
 AC_DEFINE([DEBUG])
 
