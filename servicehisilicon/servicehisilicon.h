@@ -263,6 +263,10 @@ private:
 	int m_state;
 	static const char *getVidFormatStr(uint32_t format);
 	static const char *getAudFormatStr(uint32_t format);
+	std::string getAudDescription(const HI_FORMAT_AUD_INFO_S *stream);
+	bool m_dts_scan_done = false;
+	std::string m_dts_scan_profile;
+	void setDTSScanProfile(const std::string &profile) { m_dts_scan_profile = profile; m_dts_scan_done = true; }
 	static const char *getSubFormatStr(uint32_t format);
 	int m_audio_fd, m_video_fd;
 	int netlink_socket;
