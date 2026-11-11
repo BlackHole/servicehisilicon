@@ -46,20 +46,39 @@ namespace
 {
 /*
  * servicehisilicon replaces the normal 0x1001 servicemp3 factory.  The
- * HiSilicon player is useful for TrueHD because it can pass it through, but
- * using it for every other media type loses servicemp3's richer codec/channel
- * reporting and its DTS/TrueHD -> AC3 software transcoding path.
+ * HiSilicon player is useful for TrueHD and DTS (DTS, DTS-ES, DTS 96/24,
+ * DTS-HD HRA, DTS-HD MA, DTS:X, DTS Express) because it can pass them
+ * through, but using it for every other media type loses servicemp3's
+ * richer codec/channel reporting.
  *
  * Probe the source before constructing the service and only select the
- * proprietary player when a TrueHD stream is actually present.  For all
- * other sources the original OpenBH eServiceMP3 implementation is used.
+ * proprietary player when a TrueHD or DTS stream is actually present.  For
+ * all other sources the original OpenBH eServiceMP3 implementation is used.
  */
-bool discovererStreamIsTrueHD(GstDiscovererStreamInfo *stream)
+std::string toLower(std::string value)
+{
+	for (std::string::iterator it = value.begin(); it != value.end(); ++it)
+		*it = g_ascii_tolower(*it);
+	return value;
+}
+
+bool codecNameNeedsHisilicon(const std::string &name)
+{
+	const std::string value = toLower(name);
+	return value.find("truehd") != std::string::npos ||
+		value.find("true-hd") != std::string::npos ||
+		value.find("true hd") != std::string::npos ||
+		value.find("mlp") != std::string::npos ||
+		value.find("dts") != std::string::npos ||
+		value.find("dca") != std::string::npos;
+}
+
+bool discovererStreamNeedsHisilicon(GstDiscovererStreamInfo *stream, std::string &codec_out)
 {
 	if (!stream)
 		return false;
 
-	bool truehd = false;
+	bool match = false;
 	GstCaps *caps = gst_discoverer_stream_info_get_caps(stream);
 	if (caps)
 	{
@@ -67,42 +86,51 @@ bool discovererStreamIsTrueHD(GstDiscovererStreamInfo *stream)
 		{
 			const GstStructure *st = gst_caps_get_structure(caps, i);
 			const gchar *name = gst_structure_get_name(st);
-			if (name && (!g_ascii_strcasecmp(name, "audio/x-true-hd") ||
-				!g_ascii_strcasecmp(name, "audio/x-truehd") ||
-				!g_ascii_strcasecmp(name, "audio/true-hd")))
+			/* audio/x-true-hd, audio/x-truehd, audio/true-hd, audio/x-mlp,
+			 * audio/x-dts, audio/x-dtshd, audio/dts, ... */
+			if (name && codecNameNeedsHisilicon(name))
 			{
-				truehd = true;
+				codec_out = name;
+				match = true;
 				break;
 			}
 		}
 		gst_caps_unref(caps);
 	}
 
-	if (!truehd)
+	if (!match)
 	{
 		const GstTagList *tags = gst_discoverer_stream_info_get_tags(stream);
 		gchar *codec = NULL;
 		if (tags && gst_tag_list_get_string(tags, GST_TAG_AUDIO_CODEC, &codec) && codec)
 		{
-			std::string value(codec);
-			for (std::string::iterator it = value.begin(); it != value.end(); ++it)
-				*it = g_ascii_tolower(*it);
-			truehd = value.find("truehd") != std::string::npos || value.find("true hd") != std::string::npos;
+			if (codecNameNeedsHisilicon(codec))
+			{
+				codec_out = codec;
+				match = true;
+			}
 		}
 		g_free(codec);
 	}
 
-	return truehd;
+	if (match && GST_IS_DISCOVERER_AUDIO_INFO(stream))
+	{
+		guint channels = gst_discoverer_audio_info_get_channels(GST_DISCOVERER_AUDIO_INFO(stream));
+		if (channels)
+			codec_out += " (" + std::to_string(channels) + "ch)";
+	}
+
+	return match;
 }
 
-bool sourceUsesTrueHD(const eServiceReference &ref)
+bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 {
 	std::string path = ref.path;
 
 	/* servicehisilicon uses #... for HTTP headers and &suburi=... for an
 	 * external subtitle. Neither belongs to the URI passed to discoverer. */
 	size_t pos = path.find('#');
-	if (pos != std::string::npos)
+	if (pos != std::string::npos && (path.compare(0, 4, "http") == 0 || path.compare(0, 4, "rtsp") == 0))
 		path.erase(pos);
 	pos = path.find("&suburi=");
 	if (pos != std::string::npos)
@@ -111,25 +139,27 @@ bool sourceUsesTrueHD(const eServiceReference &ref)
 	if (path.empty())
 		return false;
 
-	/* Raw TrueHD/MLP files do not need a full probe. */
-	size_t end = path.find_first_of("?#");
+	/* Raw TrueHD/MLP/DTS files do not need a full probe. */
+	size_t end = path[0] == '/' ? std::string::npos : path.find_first_of("?#");
 	if (end == std::string::npos)
 		end = path.size();
 	size_t dot = path.rfind('.', end);
 	if (dot != std::string::npos)
 	{
-		std::string ext = path.substr(dot, end - dot);
-		for (std::string::iterator it = ext.begin(); it != ext.end(); ++it)
-			*it = g_ascii_tolower(*it);
-		if (ext == ".truehd" || ext == ".thd")
+		const std::string ext = toLower(path.substr(dot, end - dot));
+		if (ext == ".truehd" || ext == ".thd" || ext == ".mlp" ||
+			ext == ".dts" || ext == ".dtshd" || ext == ".dtsma")
+		{
+			codec = ext;
 			return true;
+		}
 	}
 
 	GError *error = NULL;
 	GstDiscoverer *discoverer = gst_discoverer_new(3 * GST_SECOND, &error);
 	if (!discoverer)
 	{
-		eDebug("[eServiceHisilicon] TrueHD probe unavailable: %s", error ? error->message : "unknown error");
+		eDebug("[eServiceHisilicon] TrueHD/DTS probe unavailable: %s", error ? error->message : "unknown error");
 		if (error)
 			g_error_free(error);
 		return false;
@@ -143,15 +173,15 @@ bool sourceUsesTrueHD(const eServiceReference &ref)
 		uri = uri_alloc;
 	}
 
-	bool truehd = false;
+	bool match = false;
 	if (uri)
 	{
 		GstDiscovererInfo *info = gst_discoverer_discover_uri(discoverer, uri, &error);
 		if (info)
 		{
 			GList *audio_streams = gst_discoverer_info_get_audio_streams(info);
-			for (GList *it = audio_streams; it && !truehd; it = it->next)
-				truehd = discovererStreamIsTrueHD(GST_DISCOVERER_STREAM_INFO(it->data));
+			for (GList *it = audio_streams; it && !match; it = it->next)
+				match = discovererStreamNeedsHisilicon(GST_DISCOVERER_STREAM_INFO(it->data), codec);
 			gst_discoverer_stream_info_list_free(audio_streams);
 			gst_discoverer_info_unref(info);
 		}
@@ -159,15 +189,322 @@ bool sourceUsesTrueHD(const eServiceReference &ref)
 
 	if (error)
 	{
-		eDebug("[eServiceHisilicon] TrueHD probe failed for '%s': %s; falling back to eServiceMP3",
+		eDebug("[eServiceHisilicon] TrueHD/DTS probe failed for '%s': %s; falling back to eServiceMP3",
 			path.c_str(), error->message);
 		g_error_free(error);
 	}
 	g_free(uri_alloc);
 	g_object_unref(discoverer);
 
-	return truehd;
+	return match;
 }
+
+/*
+ * The HiSilicon demuxer is built on an old FFmpeg that predates the DTS:X
+ * profiles, and for some files it reports no usable DTS profile at all.  It
+ * also gives us no access to the elementary stream, so look for the DTS
+ * extension sync words directly in the source data instead.  These are the
+ * same markers FFmpeg and eServiceMP3 use:
+ *   0x64582025 EXSS (DTS-HD extension substream)
+ *   0x41a29547 XLL  (lossless, DTS-HD MA)
+ *   0x655e315e XBR  (DTS-HD HRA)
+ *   0x0a801921 LBR  (DTS Express)
+ *   0x02000850 DTS:X       (XLL extension)
+ *   0xf14000d0 DTS:X IMAX  (XLL extension, low bit ignored)
+ * Each marker has to be seen several times before it counts, so a chance
+ * match in video data is not mistaken for one.
+ */
+struct DTSMarkerScan
+{
+	enum { needed = 3 };
+
+	unsigned int exss, xll, xbr, lbr, dtsx, dtsx_imax;
+	uint32_t word;
+
+	DTSMarkerScan(): exss(0), xll(0), xbr(0), lbr(0), dtsx(0), dtsx_imax(0), word(0) {}
+
+	/* Call when the next data is not contiguous with the previous data. */
+	void discontinuity() { word = 0; }
+
+	void feed(const unsigned char *data, size_t size)
+	{
+		for (size_t n = 0; n < size; ++n)
+		{
+			word = (word << 8) | data[n];
+			switch (word)
+			{
+			case 0x64582025: ++exss; break;
+			case 0x41a29547: ++xll; break;
+			case 0x655e315e: ++xbr; break;
+			case 0x0a801921: ++lbr; break;
+			case 0x02000850: ++dtsx; break;
+			default:
+				if ((word >> 1) == (0xf14000d0U >> 1))
+					++dtsx_imax;
+				break;
+			}
+		}
+	}
+
+	/* DTS:X markers are carried in every lossless frame, so the answer is
+	 * clear once a few are seen, or once plenty of frames had none. */
+	bool decided() const
+	{
+		if (xll >= needed && (dtsx >= needed || dtsx_imax >= needed))
+			return true;
+		return xll >= 64 && !dtsx && !dtsx_imax;
+	}
+
+	/* An enigma2 codec name, or empty when nothing beyond core DTS was found. */
+	std::string profile() const
+	{
+		if (xll >= needed && dtsx_imax >= needed)
+			return "DTS-HD MA + DTS:X IMAX";
+		if (xll >= needed && dtsx >= needed)
+			return "DTS-HD MA + DTS:X";
+		if (xll >= needed)
+			return "DTS-HD MA";
+		if (exss >= needed && xbr >= needed)
+			return "DTS-HD HRA";
+		if (exss >= needed && lbr >= needed)
+			return "DTS Express";
+		return "";
+	}
+
+	void log(const char *source, guint64 bytes) const
+	{
+		eDebug("[eServiceHisilicon] DTS scan (%s, %llu bytes): exss=%u xll=%u xbr=%u lbr=%u dtsx=%u dtsx_imax=%u -> '%s'",
+			source, (unsigned long long)bytes, exss, xll, xbr, lbr, dtsx, dtsx_imax, profile().c_str());
+	}
+};
+
+bool isHttpUri(const std::string &path)
+{
+	return path.compare(0, 7, "http://") == 0 || path.compare(0, 8, "https://") == 0;
+}
+
+/* Scan a local file.  Returns "" for anything that is not a local file. */
+std::string scanFileForDTSProfile(const std::string &ref_path)
+{
+	static const off_t window = 8 * 1024 * 1024;
+	static const size_t chunk = 256 * 1024;
+
+	std::string path = ref_path;
+	size_t pos = path.find("&suburi=");
+	if (pos != std::string::npos)
+		path.erase(pos);
+	if (path.compare(0, 7, "file://") == 0)
+		path.erase(0, 7);
+	if (path.empty() || path[0] != '/')
+		return "";
+
+	int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return "";
+
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode))
+	{
+		::close(fd);
+		return "";
+	}
+
+	DTSMarkerScan scan;
+	guint64 bytes = 0;
+	unsigned char *buf = (unsigned char*)malloc(chunk);
+	bool finished = !buf;
+
+	/* The start of the file, then the middle in case the start held no audio. */
+	const off_t starts[2] = { 0, st.st_size > 4 * window ? st.st_size / 2 : -1 };
+	for (int w = 0; w < 2 && !finished; ++w)
+	{
+		if (starts[w] < 0 || (w == 1 && (scan.xll || scan.exss)))
+			break;
+
+		scan.discontinuity();
+		off_t offset = starts[w];
+		const off_t stop = starts[w] + window;
+		while (offset < stop && !finished)
+		{
+			ssize_t got = pread(fd, buf, chunk, offset);
+			if (got <= 0)
+				break;
+			offset += got;
+			bytes += got;
+			scan.feed(buf, got);
+			finished = scan.decided();
+		}
+	}
+
+	free(buf);
+	::close(fd);
+
+	scan.log("file", bytes);
+	return scan.profile();
+}
+
+/*
+ * Scan the start of an HTTP(S) source.  This runs from the factory, before
+ * the HiSilicon player opens its own connection, so the two never overlap;
+ * the data read here is what the player has to buffer first anyway.  The
+ * request is dropped as soon as the answer is clear, after scan_limit
+ * bytes, or after scan_timeout, whichever comes first.
+ */
+struct HttpDTSScan
+{
+	DTSMarkerScan scan;
+	guint64 bytes;
+	bool done;
+	GstElement *pipeline;
+};
+
+GstPadProbeReturn httpDTSScanProbe(GstPad *, GstPadProbeInfo *info, gpointer user_data)
+{
+	static const guint64 scan_limit = 8 * 1024 * 1024;
+
+	HttpDTSScan *ctx = static_cast<HttpDTSScan*>(user_data);
+	GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+	if (!ctx || !buffer || ctx->done)
+		return GST_PAD_PROBE_OK;
+
+	GstMapInfo map;
+	if (gst_buffer_map(buffer, &map, GST_MAP_READ))
+	{
+		ctx->scan.feed(map.data, map.size);
+		ctx->bytes += map.size;
+		gst_buffer_unmap(buffer, &map);
+	}
+
+	if (ctx->scan.decided() || ctx->bytes >= scan_limit)
+	{
+		ctx->done = true;
+		gst_element_post_message(ctx->pipeline,
+			gst_message_new_application(GST_OBJECT(ctx->pipeline), gst_structure_new_empty("dts-scan-done")));
+	}
+	return GST_PAD_PROBE_OK;
+}
+
+std::string scanHttpForDTSProfile(const std::string &ref_path)
+{
+	static const GstClockTime scan_timeout = 5 * GST_SECOND;
+
+	/* Same layout the service itself parses: url#Header=Value&Header=Value */
+	std::string url = ref_path;
+	std::string headers;
+	size_t pos = url.find('#');
+	if (pos != std::string::npos)
+	{
+		headers = url.substr(pos + 1);
+		url.erase(pos);
+	}
+	pos = url.find("&suburi=");
+	if (pos != std::string::npos)
+		url.erase(pos);
+	if (!isHttpUri(url))
+		return "";
+
+	GError *error = NULL;
+	GstElement *src = gst_element_make_from_uri(GST_URI_SRC, url.c_str(), "dts-scan-src", &error);
+	GstElement *sink = gst_element_factory_make("fakesink", "dts-scan-sink");
+	GstElement *pipeline = gst_pipeline_new("dts-scan");
+	if (!src || !sink || !pipeline)
+	{
+		eDebug("[eServiceHisilicon] DTS scan (http) unavailable: %s", error ? error->message : "missing element");
+		if (error)
+			g_error_free(error);
+		if (src)
+			gst_object_unref(src);
+		if (sink)
+			gst_object_unref(sink);
+		if (pipeline)
+			gst_object_unref(pipeline);
+		return "";
+	}
+
+	gst_bin_add_many(GST_BIN(pipeline), src, sink, NULL);
+	if (!gst_element_link(src, sink))
+	{
+		gst_object_unref(pipeline);
+		return "";
+	}
+	g_object_set(sink, "sync", FALSE, NULL);
+
+	std::string useragent = "Enigma2 HbbTV/1.1.1 (+PVR+RTSP+DL;OpenViX;;;)";
+	if (eConfigManager::getConfigBoolValue("config.mediaplayer.useAlternateUserAgent"))
+		useragent = eConfigManager::getConfigValue("config.mediaplayer.alternateUserAgent");
+
+	GstStructure *extra = gst_structure_new_empty("extra-headers");
+	size_t start = 0;
+	while (start < headers.size())
+	{
+		size_t end = headers.find('&', start);
+		if (end == std::string::npos)
+			end = headers.size();
+		const std::string field = headers.substr(start, end - start);
+		const size_t eq = field.find('=');
+		if (eq != std::string::npos && eq > 0)
+		{
+			const std::string name = field.substr(0, eq);
+			const std::string value = field.substr(eq + 1);
+			if (!g_ascii_strcasecmp(name.c_str(), "User-Agent"))
+				useragent = value;
+			else
+				gst_structure_set(extra, name.c_str(), G_TYPE_STRING, value.c_str(), NULL);
+		}
+		start = end + 1;
+	}
+
+	GObjectClass *klass = G_OBJECT_GET_CLASS(src);
+	if (g_object_class_find_property(klass, "user-agent"))
+		g_object_set(src, "user-agent", useragent.c_str(), NULL);
+	if (gst_structure_n_fields(extra) > 0 && g_object_class_find_property(klass, "extra-headers"))
+		g_object_set(src, "extra-headers", extra, NULL);
+	if (g_object_class_find_property(klass, "ssl-strict"))
+		g_object_set(src, "ssl-strict", FALSE, NULL);
+	if (g_object_class_find_property(klass, "timeout"))
+		g_object_set(src, "timeout", 5, NULL);
+	gst_structure_free(extra);
+
+	HttpDTSScan ctx;
+	ctx.bytes = 0;
+	ctx.done = false;
+	ctx.pipeline = pipeline;
+
+	GstPad *pad = gst_element_get_static_pad(src, "src");
+	if (pad)
+	{
+		gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, httpDTSScanProbe, &ctx, NULL);
+		gst_object_unref(pad);
+	}
+
+	gst_element_set_state(pipeline, GST_STATE_PLAYING);
+	GstBus *bus = gst_element_get_bus(pipeline);
+	GstMessage *msg = gst_bus_timed_pop_filtered(bus, scan_timeout,
+		(GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_APPLICATION));
+	if (msg)
+	{
+		if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR)
+		{
+			GError *err = NULL;
+			gst_message_parse_error(msg, &err, NULL);
+			eDebug("[eServiceHisilicon] DTS scan (http) failed: %s", err ? err->message : "unknown error");
+			if (err)
+				g_error_free(err);
+		}
+		gst_message_unref(msg);
+	}
+	else
+		eDebug("[eServiceHisilicon] DTS scan (http) timed out");
+	gst_object_unref(bus);
+
+	/* Stops the streaming thread, so ctx is no longer touched after this. */
+	gst_element_set_state(pipeline, GST_STATE_NULL);
+	gst_object_unref(pipeline);
+
+	ctx.scan.log("http", ctx.bytes);
+	return ctx.scan.profile();
+}
+
 }
 
 eServiceFactoryHisilicon::eServiceFactoryHisilicon()
@@ -243,14 +580,21 @@ DEFINE_REF(eServiceFactoryHisilicon)
 	// iServiceHandler
 RESULT eServiceFactoryHisilicon::play(const eServiceReference &ref, ePtr<iPlayableService> &ptr)
 {
-	if (sourceUsesTrueHD(ref))
+	std::string codec;
+	if (sourceNeedsHisilicon(ref, codec))
 	{
-		eDebug("[eServiceHisilicon] TrueHD detected - using HiSilicon player");
-		ptr = new eServiceHisilicon(ref);
+		eDebug("[eServiceHisilicon] TrueHD/DTS detected (%s) - using HiSilicon player", codec.c_str());
+		eServiceHisilicon *service = new eServiceHisilicon(ref);
+		/* Local files are scanned for the DTS variant on demand.  A stream
+		 * has to be scanned now, before the player opens its connection. */
+		const std::string lower = toLower(codec);
+		if (isHttpUri(ref.path) && (lower.find("dts") != std::string::npos || lower.find("dca") != std::string::npos))
+			service->setDTSScanProfile(scanHttpForDTSProfile(ref.path));
+		ptr = service;
 	}
 	else
 	{
-		eDebug("[eServiceHisilicon] no TrueHD detected - using OpenBH eServiceMP3");
+		eDebug("[eServiceHisilicon] no TrueHD/DTS detected - using OpenBH eServiceMP3");
 		ptr = new eServiceMP3(ref);
 	}
 	return 0;
@@ -1556,6 +1900,82 @@ const char *eServiceHisilicon::getVidFormatStr(uint32_t format)
 	return "UNKNOWN";
 }
 
+std::string eServiceHisilicon::getAudDescription(const HI_FORMAT_AUD_INFO_S *stream)
+{
+	if (!stream)
+		return "";
+
+	std::string desc = getAudFormatStr(stream->u32Format);
+
+	/* The names must match enigma2's AUDIO_CODEC_DISPLAY table exactly, so
+	 * the channel layout is NOT appended here: enigma2 renders 1.0, 2.0,
+	 * 5.1, 7.1 etc. itself from iAudioTrackInfo::m_channels. */
+	if (stream->u32Format != HI_FORMAT_AUDIO_DTS)
+		return desc;
+
+	/* The HiSilicon demuxer is FFmpeg based and passes the FFmpeg codec
+	 * profile through. */
+	const uint32_t profile = stream->u32Profile;
+	bool profile_known = true;
+	switch (profile)
+	{
+	case 20: break;                             /* FF_PROFILE_DTS */
+	case 30: desc = "DTS-ES"; break;            /* FF_PROFILE_DTS_ES */
+	case 40: desc = "DTS 96/24"; break;         /* FF_PROFILE_DTS_96_24 */
+	case 50: desc = "DTS-HD HRA"; break;        /* FF_PROFILE_DTS_HD_HRA */
+	case 60: desc = "DTS-HD MA"; break;         /* FF_PROFILE_DTS_HD_MA */
+	case 61: return "DTS-HD MA + DTS:X";        /* FF_PROFILE_DTS_HD_MA_X */
+	case 62: return "DTS-HD MA + DTS:X IMAX";   /* FF_PROFILE_DTS_HD_MA_X_IMAX */
+	case 70: desc = "DTS Express"; break;       /* FF_PROFILE_DTS_EXPRESS */
+	default: profile_known = false; break;
+	}
+
+	/* Core DTS carries at most 6.1, so a "core" track with more channels
+	 * was not identified properly either. */
+	if (profile == 20 && stream->u16Channels > 7)
+		profile_known = false;
+
+	if (profile_known && profile != 60)
+		return desc;
+
+	/* DTS-HD MA may really be DTS:X, and an unidentified track may be any
+	 * of the HD variants: ask the bitstream.  The file is scanned once. */
+	if (!m_dts_scan_done)
+	{
+		m_dts_scan_profile = scanFileForDTSProfile(m_ref.path);
+		m_dts_scan_done = true;
+		eDebug("[eServiceHisilicon] DTS scan result: '%s'", m_dts_scan_profile.c_str());
+	}
+	if (m_dts_scan_profile.empty())
+		return desc;
+
+	if (profile == 60)
+	{
+		/* Only upgrade MA to DTS:X; never downgrade what the demuxer found. */
+		if (m_dts_scan_profile.find("DTS:X") != std::string::npos)
+			desc = m_dts_scan_profile;
+		return desc;
+	}
+
+	/* Unidentified track.  The scan covers the whole file, so only apply it
+	 * where it cannot be a plain core track: more than 5.1 channels, or the
+	 * only DTS track in the programme. */
+	unsigned int dts_tracks = 0;
+	if (fileinfo.u32ProgramNum > 0 && streamid.programid < fileinfo.u32ProgramNum)
+	{
+		const HI_FORMAT_PROGRAM_INFO_S &program = fileinfo.pastProgramInfo[streamid.programid];
+		for (uint32_t i = 0; i < program.u32AudStreamNum; ++i)
+		{
+			if (program.pastAudStream[i].u32Format == HI_FORMAT_AUDIO_DTS)
+				++dts_tracks;
+		}
+	}
+	if (stream->u16Channels > 6 || dts_tracks <= 1)
+		desc = m_dts_scan_profile;
+
+	return desc;
+}
+
 const char *eServiceHisilicon::getAudFormatStr(uint32_t format)
 {
 	switch (format)
@@ -1723,7 +2143,7 @@ const char *eServiceHisilicon::getAudFormatStr(uint32_t format)
 		return "AC4";
 		break;
 	case HI_FORMAT_AUDIO_DTS_EXPRESS:
-		return "DTS_EXPRESS";
+		return "DTS Express";
 		break;
 
 	case HI_FORMAT_AUDIO_PCM: /* various PCM "codecs" */
@@ -1931,7 +2351,7 @@ std::string eServiceHisilicon::getInfoString(int w)
 	case sTagAudioCodec:
 		if (pstAudStream)
 		{
-			return getAudFormatStr(pstAudStream->u32Format);
+			return getAudDescription(pstAudStream);
 		}
 		break;
 	case sTagVideoCodec:
@@ -2103,7 +2523,7 @@ RESULT eServiceHisilicon::getTrackInfo(struct iAudioTrackInfo &info, unsigned in
 		return -2;
 	}
 
-	info.m_description = getAudFormatStr(pstAudStream->u32Format);
+	info.m_description = getAudDescription(pstAudStream);
 	info.m_channels = pstAudStream->u16Channels;
 
 	if (info.m_language.empty())
