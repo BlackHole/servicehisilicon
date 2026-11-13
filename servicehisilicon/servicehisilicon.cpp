@@ -52,8 +52,10 @@ namespace
  * richer codec/channel reporting.
  *
  * Probe the source before constructing the service and only select the
- * proprietary player when a TrueHD or DTS stream is actually present.  For
- * all other sources the original OpenBH eServiceMP3 implementation is used.
+ * proprietary player when a TrueHD or DTS stream is actually present, and
+ * the user has not asked for that codec to be transcoded (see
+ * transcodingWanted()).  For all other sources the original OpenBH
+ * eServiceMP3 implementation is used.
  */
 std::string toLower(std::string value)
 {
@@ -62,23 +64,35 @@ std::string toLower(std::string value)
 	return value;
 }
 
-bool codecNameNeedsHisilicon(const std::string &name)
+enum HisiliconCodec
+{
+	hisiNone = 0,
+	hisiTrueHD = 1,
+	hisiDTS = 2
+};
+
+/* which of the two codecs the HiSilicon player is wanted for a name is */
+int codecNameKind(const std::string &name)
 {
 	const std::string value = toLower(name);
-	return value.find("truehd") != std::string::npos ||
+	if (value.find("truehd") != std::string::npos ||
 		value.find("true-hd") != std::string::npos ||
 		value.find("true hd") != std::string::npos ||
-		value.find("mlp") != std::string::npos ||
-		value.find("dts") != std::string::npos ||
-		value.find("dca") != std::string::npos;
+		value.find("mlp") != std::string::npos)
+		return hisiTrueHD;
+	if (value.find("dts") != std::string::npos ||
+		value.find("dca") != std::string::npos)
+		return hisiDTS;
+	return hisiNone;
 }
 
-bool discovererStreamNeedsHisilicon(GstDiscovererStreamInfo *stream, std::string &codec_out)
+int discovererStreamKind(GstDiscovererStreamInfo *stream, std::string &codec_out)
 {
 	if (!stream)
-		return false;
+		return hisiNone;
 
-	bool match = false;
+	int kind = hisiNone;
+	std::string name_out;
 	GstCaps *caps = gst_discoverer_stream_info_get_caps(stream);
 	if (caps)
 	{
@@ -88,42 +102,57 @@ bool discovererStreamNeedsHisilicon(GstDiscovererStreamInfo *stream, std::string
 			const gchar *name = gst_structure_get_name(st);
 			/* audio/x-true-hd, audio/x-truehd, audio/true-hd, audio/x-mlp,
 			 * audio/x-dts, audio/x-dtshd, audio/dts, ... */
-			if (name && codecNameNeedsHisilicon(name))
+			if (name && (kind = codecNameKind(name)) != hisiNone)
 			{
-				codec_out = name;
-				match = true;
+				name_out = name;
 				break;
 			}
 		}
 		gst_caps_unref(caps);
 	}
 
-	if (!match)
+	if (kind == hisiNone)
 	{
 		const GstTagList *tags = gst_discoverer_stream_info_get_tags(stream);
 		gchar *codec = NULL;
 		if (tags && gst_tag_list_get_string(tags, GST_TAG_AUDIO_CODEC, &codec) && codec)
 		{
-			if (codecNameNeedsHisilicon(codec))
-			{
-				codec_out = codec;
-				match = true;
-			}
+			if ((kind = codecNameKind(codec)) != hisiNone)
+				name_out = codec;
 		}
 		g_free(codec);
 	}
 
-	if (match && GST_IS_DISCOVERER_AUDIO_INFO(stream))
+	if (kind != hisiNone && GST_IS_DISCOVERER_AUDIO_INFO(stream))
 	{
 		guint channels = gst_discoverer_audio_info_get_channels(GST_DISCOVERER_AUDIO_INFO(stream));
 		if (channels)
-			codec_out += " (" + std::to_string(channels) + "ch)";
+			name_out += " (" + std::to_string(channels) + "ch)";
 	}
-
-	return match;
+	if (kind != hisiNone)
+	{
+		if (!codec_out.empty())
+			codec_out += ", ";
+		codec_out += name_out;
+	}
+	return kind;
 }
 
-bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
+/*
+ * The HiSilicon player passes TrueHD and DTS through untouched, but cannot
+ * transcode them.  When the user has asked for a codec to be transcoded
+ * (Dolby Digital or Dolby Digital Plus, for receivers that cannot decode it),
+ * a source with that codec is left to eServiceMP3, which does the transcoding.
+ */
+bool transcodingWanted(int kind)
+{
+	const char *key = kind == hisiTrueHD ? "config.av.truehd_playback" : "config.av.dts_playback";
+	const std::string value = eConfigManager::getConfigValue(key);
+	return !value.empty() && value != "off";
+}
+
+/* the TrueHD/DTS codecs (hisiTrueHD | hisiDTS) found in the source */
+int sourceHisiliconCodecs(const eServiceReference &ref, std::string &codec)
 {
 	std::string path = ref.path;
 
@@ -137,7 +166,7 @@ bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 		path.erase(pos);
 
 	if (path.empty())
-		return false;
+		return hisiNone;
 
 	/* Raw TrueHD/MLP/DTS files do not need a full probe. */
 	size_t end = path[0] == '/' ? std::string::npos : path.find_first_of("?#");
@@ -147,11 +176,15 @@ bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 	if (dot != std::string::npos)
 	{
 		const std::string ext = toLower(path.substr(dot, end - dot));
-		if (ext == ".truehd" || ext == ".thd" || ext == ".mlp" ||
-			ext == ".dts" || ext == ".dtshd" || ext == ".dtsma")
+		if (ext == ".truehd" || ext == ".thd" || ext == ".mlp")
 		{
 			codec = ext;
-			return true;
+			return hisiTrueHD;
+		}
+		if (ext == ".dts" || ext == ".dtshd" || ext == ".dtsma")
+		{
+			codec = ext;
+			return hisiDTS;
 		}
 	}
 
@@ -162,7 +195,7 @@ bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 		eDebug("[eServiceHisilicon] TrueHD/DTS probe unavailable: %s", error ? error->message : "unknown error");
 		if (error)
 			g_error_free(error);
-		return false;
+		return hisiNone;
 	}
 
 	gchar *uri_alloc = NULL;
@@ -173,15 +206,16 @@ bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 		uri = uri_alloc;
 	}
 
-	bool match = false;
+	int kinds = hisiNone;
 	if (uri)
 	{
 		GstDiscovererInfo *info = gst_discoverer_discover_uri(discoverer, uri, &error);
 		if (info)
 		{
+			/* every track: a file may have both, or TrueHD next to DTS */
 			GList *audio_streams = gst_discoverer_info_get_audio_streams(info);
-			for (GList *it = audio_streams; it && !match; it = it->next)
-				match = discovererStreamNeedsHisilicon(GST_DISCOVERER_STREAM_INFO(it->data), codec);
+			for (GList *it = audio_streams; it; it = it->next)
+				kinds |= discovererStreamKind(GST_DISCOVERER_STREAM_INFO(it->data), codec);
 			gst_discoverer_stream_info_list_free(audio_streams);
 			gst_discoverer_info_unref(info);
 		}
@@ -196,7 +230,7 @@ bool sourceNeedsHisilicon(const eServiceReference &ref, std::string &codec)
 	g_free(uri_alloc);
 	g_object_unref(discoverer);
 
-	return match;
+	return kinds;
 }
 
 /*
@@ -581,14 +615,24 @@ DEFINE_REF(eServiceFactoryHisilicon)
 RESULT eServiceFactoryHisilicon::play(const eServiceReference &ref, ePtr<iPlayableService> &ptr)
 {
 	std::string codec;
-	if (sourceNeedsHisilicon(ref, codec))
+	const int kinds = sourceHisiliconCodecs(ref, codec);
+	/* A track set to be transcoded needs eServiceMP3.  It also takes the
+	 * whole source when other tracks would pass through, as the player
+	 * cannot be changed when the user switches tracks. */
+	const bool transcode = ((kinds & hisiTrueHD) && transcodingWanted(hisiTrueHD)) ||
+		((kinds & hisiDTS) && transcodingWanted(hisiDTS));
+	if (kinds != hisiNone && transcode)
+	{
+		eDebug("[eServiceHisilicon] TrueHD/DTS detected (%s), set to be transcoded - using OpenBH eServiceMP3", codec.c_str());
+		ptr = new eServiceMP3(ref);
+	}
+	else if (kinds != hisiNone)
 	{
 		eDebug("[eServiceHisilicon] TrueHD/DTS detected (%s) - using HiSilicon player", codec.c_str());
 		eServiceHisilicon *service = new eServiceHisilicon(ref);
 		/* Local files are scanned for the DTS variant on demand.  A stream
 		 * has to be scanned now, before the player opens its connection. */
-		const std::string lower = toLower(codec);
-		if (isHttpUri(ref.path) && (lower.find("dts") != std::string::npos || lower.find("dca") != std::string::npos))
+		if (isHttpUri(ref.path) && (kinds & hisiDTS))
 			service->setDTSScanProfile(scanHttpForDTSProfile(ref.path));
 		ptr = service;
 	}
