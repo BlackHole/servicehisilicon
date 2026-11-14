@@ -1,4 +1,4 @@
-AC_INIT([servicehisilicon], [0.1], [])
+AC_INIT([servicehisilicon], [0.2], [])
 AM_INIT_AUTOMAKE([subdir-objects foreign dist-bzip2 no-define tar-pax])
 AC_CONFIG_MACRO_DIR([m4])
 LT_INIT

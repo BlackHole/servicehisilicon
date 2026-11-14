@@ -22,6 +22,9 @@
 #include <errno.h>
 #include <string>
 #include <lib/base/estring.h>
+#include <fstream>
+#include <arpa/inet.h>
+#include <endian.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
 
@@ -708,6 +711,15 @@ RESULT eHisiliconServiceOfflineOperations::getListOfFilenames(std::list<std::str
 {
 	res.clear();
 	res.push_back(m_ref.path);
+	res.push_back(m_ref.path + ".meta");
+	res.push_back(m_ref.path + ".cuts");
+	std::string filename = m_ref.path;
+	size_t pos;
+	if ((pos = filename.rfind('.')) != std::string::npos)
+	{
+		filename.erase(pos + 1);
+		res.push_back(filename + "eit");
+	}
 	return 0;
 }
 
@@ -745,6 +757,12 @@ RESULT eStaticServiceHisiliconInfo::getName(const eServiceReference &ref, std::s
 		name = ref.name;
 	else
 	{
+		if (endsWith(ref.path, ".stream") && !m_parser.parseMeta(ref.path))
+		{
+			name = m_parser.m_name;
+			return 0;
+		}
+
 		size_t last = ref.path.rfind('/');
 		if (last != std::string::npos)
 			name = ref.path.substr(last+1);
@@ -757,6 +775,27 @@ RESULT eStaticServiceHisiliconInfo::getName(const eServiceReference &ref, std::s
 
 int eStaticServiceHisiliconInfo::getLength(const eServiceReference &ref)
 {
+	constexpr int MPEG_TIMEBASE = 90000;
+
+	if (m_parser.parseMeta(ref.path) == 0)
+		return static_cast<int>(m_parser.m_length / MPEG_TIMEBASE);
+
+	/* Fallback: read CUT_TYPE_LENGTH from .cuts file */
+	std::string filename = ref.path + ".cuts";
+	std::ifstream file(filename, std::ios::binary);
+
+	if (!file)
+		return -1;
+
+	uint64_t where;
+	uint32_t what;
+
+	while (file.read(reinterpret_cast<char*>(&where), sizeof(where)) && file.read(reinterpret_cast<char*>(&what), sizeof(what)))
+	{
+		if (ntohl(what) == 5) // CUT_TYPE_LENGTH
+			return static_cast<int>(be64toh(where) / MPEG_TIMEBASE);
+	}
+
 	return -1;
 }
 
